@@ -2,6 +2,20 @@
 
 ## 1. FreeRTOS RAM 溢出问题
 
+### 工程化版本更新
+
+早期版本通过把 `configTOTAL_HEAP_SIZE` 调到 4800 B 解决链接问题，但 RAM
+仍占用 9,504 / 10,240 B，运行余量过小。当前版本将 3 个业务任务、信号量以及
+FreeRTOS Idle/Timer 任务全部改为静态分配，并关闭动态分配：
+
+```c
+#define configSUPPORT_STATIC_ALLOCATION   1
+#define configSUPPORT_DYNAMIC_ALLOCATION  0
+```
+
+同时从构建列表移除 `heap_4.c`。交叉编译后的 RAM 占用为 7,416 / 10,240 B
+（72.42%）。下面保留早期定位过程，作为理解链接期 SRAM 溢出的记录。
+
 ### 现象
 ```
 ld.exe: section `._user_heap_stack' will not fit in region `RAM'
@@ -24,7 +38,7 @@ STM32F103C6 只有 **10 KB SRAM**，将 heap 从 3072 改为 5120 后超限。
              = 10240 - 3688 - 1536 = 5016 字节
 ```
 
-### 解决方案
+### 早期解决方案（已被静态分配方案取代）
 ```c
 // FreeRTOSConfig.h
 #define configTOTAL_HEAP_SIZE       ((size_t)4800)  // 留 216 字节链接余量
@@ -133,7 +147,17 @@ Period    = 999 →  PWM 周期 = 1000 µs = 1 ms（1 kHz）
 Compare   = 500 →  占空比 50%
 ```
 
-调速只需修改 Compare 值（范围 0~999）：
+> **注意**：步进电机速度由 PWM **频率**决定，而非占空比！
+> 调速公式：速度 ∝ 频率 = 1 MHz ÷ (Period + 1)
+> Compare 只影响脉冲宽度，不影响转速。
+
+调速方法：
+- 降低速度 → 增大 `Period`（降低频率）
+- 提高速度 → 减小 `Period`（提高频率）
+- Compare 保持 500（50% 占空比）即可，TB6600 只需足够宽的脉冲
+
+示例（修改 `tim.c` 中的 `htim2.Init.Period`）：
 ```c
-__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 500); // 50% 占空比
+htim2.Init.Period = 1999;  // 500 Hz → 半速
+htim2.Init.Period = 3999;  // 250 Hz → 1/4 速
 ```

@@ -25,7 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "watchdog.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -93,8 +93,17 @@ int main(void)
   MX_TIM2_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 500);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  /* Keep a valid 50% pulse when the configured step frequency changes. */
+  __HAL_TIM_SET_COMPARE(&htim2,
+                        TIM_CHANNEL_1,
+                        (__HAL_TIM_GET_AUTORELOAD(&htim2) + 1U) / 2U);
+  if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* Independent watchdog (~1 s timeout).  The RTOS Monitor task services
+     it only while the detect/execute/communication tasks are all alive. */
+  Watchdog_Init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -190,7 +199,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* Put actuators in a safe state when GPIO has already been initialised. */
+  if (__HAL_RCC_GPIOA_IS_CLK_ENABLED())
+  {
+    HAL_GPIO_WritePin(ENA_GPIO_Port, ENA_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Cylinder_GPIO_Port, Cylinder_Pin, GPIO_PIN_RESET);
+  }
   __disable_irq();
   while (1)
   {

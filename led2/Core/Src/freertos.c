@@ -1,268 +1,523 @@
-/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * File Name          : freertos.c
-  * Description        : Code for freertos applications
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * @file    freertos.c
+  * @brief   Deterministic three-task washer inspection control loop
   ******************************************************************************
   */
-/* USER CODE END Header */
 
-/* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"
 #include "main.h"
 #include "cmsis_os.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
+#include "inspection_protocol.h"
 #include "usart.h"
-/* USER CODE END Includes */
+#include "watchdog.h"
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
+#define SENSOR_ACTIVE_LEVEL          GPIO_PIN_RESET
+#define BELT_RUN_LEVEL               GPIO_PIN_SET
+#define BELT_STOP_LEVEL              GPIO_PIN_RESET
+#define SENSOR_DEBOUNCE_MS           5U
+#define SENSOR_POLL_MS               2U
+#define CYLINDER_PULSE_MS            120U
+#define UART_BYTE_TIMEOUT_MS         4U
+#define UART_RETRY_AT_MS             195U
+/* Retry only after avg E2E latency (195 ms) has elapsed; remaining 105 ms
+   within the 300 ms budget is a best-effort window for the retry. */
+#define UART_TRANSACTION_BUDGET_MS   400U
+#define EXECUTION_WAIT_MS            (UART_TRANSACTION_BUDGET_MS + 50U)
+/* Supervision and liveness parameters. */
+#define COMM_IDLE_POLL_MS            10U
+#define MCU_HEARTBEAT_PERIOD_MS      1000U
+#define VISION_ALIVE_TIMEOUT_MS      3000U
+#define TASK_MONITOR_PERIOD_MS       100U
+#define TASK_MONITOR_STRIKE_LIMIT    5U
+#define EXECUTE_POLL_MS              50U
 
-/* USER CODE END PTD */
+typedef struct
+{
+    uint8_t code;
+    uint8_t confidence;
+    uint8_t valid;
+} InspectionDecision;
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-#define FRAME_HEADER_1   0xAA
-#define FRAME_HEADER_2   0x55
-#define FRAME_CMD        0x10
+typedef struct
+{
+    uint32_t sensor_triggers;
+    uint32_t accepted_parts;
+    uint32_t rejected_parts;
+    uint32_t fail_safe_rejects;
+    uint32_t uart_retries;
+    uint32_t uart_timeouts;
+    uint32_t uart_errors;
+    uint32_t stale_frames;
+    uint32_t protocol_errors;
+    uint32_t max_transaction_ms;
+    uint32_t heartbeats_sent;
+    uint32_t heartbeats_received;
+    uint32_t vision_lost_rejects;
+} InspectionMetrics;
 
-/* Jetson 回复帧协议: BB STATUS XOR (3字节) */
-#define REPLY_HEADER     0xBB
-#define REPLY_DEFECT     0x01   /* 有缺陷 → 剔除 */
-#define REPLY_NORMAL     0x02   /* 无缺陷 → 放行 */
+static osSemaphoreId_t inspectionStartSem;
+static osSemaphoreId_t communicationStartSem;
+static osSemaphoreId_t communicationDoneSem;
 
-#define CYLINDER_KICK_MS 1000   /* PA7 高电平持续时间 */
-#define UART_REPLY_TIMEOUT_MS 30000 /* 等待 Jetson 回复超时 (30s, 给足推理时间) */
-#define DEBOUNCE_MS      20
-#define SWITCH_POLL_MS   10
-/* USER CODE END PD */
+static StaticSemaphore_t inspectionStartSemCb;
+static StaticSemaphore_t communicationStartSemCb;
+static StaticSemaphore_t communicationDoneSemCb;
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
+static StaticTask_t detectTaskCb;
+static StaticTask_t executeTaskCb;
+static StaticTask_t communicationTaskCb;
+static StaticTask_t monitorTaskCb;
+static StackType_t detectTaskStack[128];
+static StackType_t executeTaskStack[192];
+static StackType_t communicationTaskStack[224];
+static StackType_t monitorTaskStack[96];
 
-/* USER CODE END PM */
+static osThreadId_t detectTaskHandle;
+static osThreadId_t executeTaskHandle;
+static osThreadId_t communicationTaskHandle;
 
-/* Private variables ---------------------------------------------------------*/
-/* USER CODE BEGIN Variables */
-static osSemaphoreId_t detectSemHandle;
-static osSemaphoreId_t uartSemHandle;
-static osSemaphoreId_t uartDoneSemHandle;
-static volatile uint8_t g_uartReply;   /* 上位机回复字节：0x01 或 0x02 */
-/* USER CODE END Variables */
-/* Definitions for defaultTask */
-osThreadId_t defaultTaskHandle;
-const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
+static volatile uint8_t activeSequence;
+static InspectionDecision sharedDecision;
+static volatile InspectionMetrics metrics;
 
-/* Private function prototypes -----------------------------------------------*/
-/* USER CODE BEGIN FunctionPrototypes */
-static void vDetectTask(void *argument);
-static void vControlTask(void *argument);
-static void vUartTask(void *argument);
-/* USER CODE END FunctionPrototypes */
+/* Liveness counters incremented once per iteration by each supervised
+   task; the Monitor task compares them and services the IWDG only while
+   all three keep advancing. */
+static volatile uint32_t detectAliveCounter;
+static volatile uint32_t executeAliveCounter;
+static volatile uint32_t communicationAliveCounter;
+static volatile uint32_t visionLastSeenAt;
 
-void StartDefaultTask(void *argument);
+static void DetectTask(void *argument);
+static void ExecuteTask(void *argument);
+static void CommunicationTask(void *argument);
+static void MonitorTask(void *argument);
+static bool CommunicationExchange(uint8_t sequence, InspectionDecision *decision);
+static void CommunicationIdleService(void);
+static bool CommunicationIsVisionAlive(void);
+static void BeltSetRunning(bool running);
+static void FailSafeHalt(void);
 
-void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+void MX_FREERTOS_Init(void)
+{
+    static const osSemaphoreAttr_t inspectionStartSemAttr = {
+        .name = "inspectionStart",
+        .cb_mem = &inspectionStartSemCb,
+        .cb_size = sizeof(inspectionStartSemCb)
+    };
+    static const osSemaphoreAttr_t communicationStartSemAttr = {
+        .name = "communicationStart",
+        .cb_mem = &communicationStartSemCb,
+        .cb_size = sizeof(communicationStartSemCb)
+    };
+    static const osSemaphoreAttr_t communicationDoneSemAttr = {
+        .name = "communicationDone",
+        .cb_mem = &communicationDoneSemCb,
+        .cb_size = sizeof(communicationDoneSemCb)
+    };
+    static const osThreadAttr_t detectTaskAttr = {
+        .name = "Detect",
+        .cb_mem = &detectTaskCb,
+        .cb_size = sizeof(detectTaskCb),
+        .stack_mem = detectTaskStack,
+        .stack_size = sizeof(detectTaskStack),
+        .priority = osPriorityNormal
+    };
+    static const osThreadAttr_t executeTaskAttr = {
+        .name = "Execute",
+        .cb_mem = &executeTaskCb,
+        .cb_size = sizeof(executeTaskCb),
+        .stack_mem = executeTaskStack,
+        .stack_size = sizeof(executeTaskStack),
+        .priority = osPriorityHigh
+    };
+    static const osThreadAttr_t communicationTaskAttr = {
+        .name = "Communicate",
+        .cb_mem = &communicationTaskCb,
+        .cb_size = sizeof(communicationTaskCb),
+        .stack_mem = communicationTaskStack,
+        .stack_size = sizeof(communicationTaskStack),
+        .priority = osPriorityAboveNormal
+    };
+    static const osThreadAttr_t monitorTaskAttr = {
+        .name = "Monitor",
+        .cb_mem = &monitorTaskCb,
+        .cb_size = sizeof(monitorTaskCb),
+        .stack_mem = monitorTaskStack,
+        .stack_size = sizeof(monitorTaskStack),
+        .priority = osPriorityRealtime
+    };
 
-/**
-  * @brief  FreeRTOS initialization
-  * @param  None
-  * @retval None
-  */
-void MX_FREERTOS_Init(void) {
-  /* USER CODE BEGIN Init */
+    inspectionStartSem = osSemaphoreNew(1U, 0U, &inspectionStartSemAttr);
+    communicationStartSem = osSemaphoreNew(1U, 0U, &communicationStartSemAttr);
+    communicationDoneSem = osSemaphoreNew(1U, 0U, &communicationDoneSemAttr);
 
-  /* USER CODE END Init */
+    detectTaskHandle = osThreadNew(DetectTask, NULL, &detectTaskAttr);
+    executeTaskHandle = osThreadNew(ExecuteTask, NULL, &executeTaskAttr);
+    communicationTaskHandle = osThreadNew(CommunicationTask, NULL,
+                                          &communicationTaskAttr);
 
-  /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
-  /* USER CODE END RTOS_MUTEX */
-
-  /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
-  detectSemHandle  = osSemaphoreNew(1, 0, NULL);
-  uartSemHandle    = osSemaphoreNew(1, 0, NULL);
-  uartDoneSemHandle = osSemaphoreNew(1, 0, NULL);
-  /* USER CODE END RTOS_SEMAPHORES */
-
-  /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
-  /* USER CODE END RTOS_TIMERS */
-
-  /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
-  /* USER CODE END RTOS_QUEUES */
-
-  /* Create the thread(s) */
-  /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
-
-  /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  static const osThreadAttr_t detectTask_attr  = { .name = "DetectTask",  .stack_size = 128 * 4, .priority = osPriorityNormal };
-  static const osThreadAttr_t controlTask_attr = { .name = "ControlTask", .stack_size = 128 * 4, .priority = osPriorityAboveNormal };
-  static const osThreadAttr_t uartTask_attr    = { .name = "UartTask",    .stack_size = 256 * 4, .priority = osPriorityNormal };
-  osThreadNew(vDetectTask,  NULL, &detectTask_attr);
-  osThreadNew(vControlTask, NULL, &controlTask_attr);
-  osThreadNew(vUartTask,    NULL, &uartTask_attr);
-  /* USER CODE END RTOS_THREADS */
-
-  /* USER CODE BEGIN RTOS_EVENTS */
-  /* add events, ... */
-  /* USER CODE END RTOS_EVENTS */
-
+    if ((inspectionStartSem == NULL) ||
+        (communicationStartSem == NULL) ||
+        (communicationDoneSem == NULL) ||
+        (detectTaskHandle == NULL) ||
+        (executeTaskHandle == NULL) ||
+        (communicationTaskHandle == NULL) ||
+        (osThreadNew(MonitorTask, NULL, &monitorTaskAttr) == NULL))
+    {
+        Error_Handler();
+    }
 }
 
-/* USER CODE BEGIN Header_StartDefaultTask */
-/**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
+static void BeltSetRunning(bool running)
 {
-  /* USER CODE BEGIN StartDefaultTask */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
-  /* USER CODE END StartDefaultTask */
+    HAL_GPIO_WritePin(ENA_GPIO_Port,
+                      ENA_Pin,
+                      running ? BELT_RUN_LEVEL : BELT_STOP_LEVEL);
 }
 
-/* Private application code --------------------------------------------------*/
-/* USER CODE BEGIN Application */
-
-/**
- * @brief 检测任务：轮询光电开关 (PA6 低电平有效)，去抖后通知控制任务
- */
-static void vDetectTask(void *argument)
+static void DetectTask(void *argument)
 {
+    (void)argument;
+
     for (;;)
     {
-        if (HAL_GPIO_ReadPin(Switch_GPIO_Port, Switch_Pin) == GPIO_PIN_RESET)
+        ++detectAliveCounter;
+        if (HAL_GPIO_ReadPin(Switch_GPIO_Port, Switch_Pin) == SENSOR_ACTIVE_LEVEL)
         {
-            osDelay(DEBOUNCE_MS);   /* 去抖：等待后再次确认 */
-            if (HAL_GPIO_ReadPin(Switch_GPIO_Port, Switch_Pin) == GPIO_PIN_RESET)
+            osDelay(SENSOR_DEBOUNCE_MS);
+            if (HAL_GPIO_ReadPin(Switch_GPIO_Port, Switch_Pin) == SENSOR_ACTIVE_LEVEL)
             {
-                osSemaphoreRelease(detectSemHandle);
+                ++metrics.sensor_triggers;
+                (void)osSemaphoreRelease(inspectionStartSem);
 
-                /* 等待物体离开，避免重复触发 */
-                while (HAL_GPIO_ReadPin(Switch_GPIO_Port, Switch_Pin) == GPIO_PIN_RESET)
+                while (HAL_GPIO_ReadPin(Switch_GPIO_Port, Switch_Pin) ==
+                       SENSOR_ACTIVE_LEVEL)
                 {
-                    osDelay(SWITCH_POLL_MS);
+                    osDelay(SENSOR_POLL_MS);
                 }
             }
         }
-        osDelay(SWITCH_POLL_MS);
+        osDelay(SENSOR_POLL_MS);
     }
 }
 
-/**
- * @brief 控制任务：停带 → 发串口 → 等上位机回复 → 按回复动作 → 启带
- */
-static void vControlTask(void *argument)
+static void ExecuteTask(void *argument)
 {
+    uint8_t nextSequence = 0U;
+    osStatus_t waitStatus;
+
+    (void)argument;
+    BeltSetRunning(true);
+
     for (;;)
     {
-        osSemaphoreAcquire(detectSemHandle, osWaitForever);
-
-        /* 停止传送带 */
-        HAL_GPIO_WritePin(ENA_GPIO_Port, ENA_Pin, GPIO_PIN_RESET);
-
-        /* 通知串口任务发送帧，并等待上位机回复（串口任务会填充 g_uartReply） */
-        osSemaphoreRelease(uartSemHandle);
-        osSemaphoreAcquire(uartDoneSemHandle, osWaitForever);
-
-        if (g_uartReply == REPLY_DEFECT)
+        ++executeAliveCounter;
+        waitStatus = osSemaphoreAcquire(inspectionStartSem, EXECUTE_POLL_MS);
+        if (waitStatus != osOK)
         {
-            /* 上位机判定为缺陷：PA7 高电平 1s（剔除动作），再启带 */
+            continue;
+        }
+        BeltSetRunning(false);
+
+        ++nextSequence;
+        activeSequence = nextSequence;
+        sharedDecision.code = INSPECTION_RESULT_VISION_ERROR;
+        sharedDecision.confidence = 0U;
+        sharedDecision.valid = 0U;
+
+        /*
+         * The heartbeat watchdog already knows the vision link is dead:
+         * reject immediately instead of spending the full transaction
+         * budget.  An uninspected part must never pass the line.
+         */
+        if (!CommunicationIsVisionAlive())
+        {
+            ++metrics.fail_safe_rejects;
+            ++metrics.rejected_parts;
+            ++metrics.vision_lost_rejects;
             HAL_GPIO_WritePin(Cylinder_GPIO_Port, Cylinder_Pin, GPIO_PIN_SET);
-            osDelay(CYLINDER_KICK_MS);
+            osDelay(CYLINDER_PULSE_MS);
             HAL_GPIO_WritePin(Cylinder_GPIO_Port, Cylinder_Pin, GPIO_PIN_RESET);
+            BeltSetRunning(true);
+            continue;
         }
-        /* else REPLY_NORMAL 或超时：直接启带，不触发 PA7 */
 
-        /* 恢复传送带 */
-        HAL_GPIO_WritePin(ENA_GPIO_Port, ENA_Pin, GPIO_PIN_SET);
-    }
-}
+        (void)osSemaphoreRelease(communicationStartSem);
+        waitStatus = osSemaphoreAcquire(communicationDoneSem, EXECUTION_WAIT_MS);
 
-/**
- * @brief 串口任务：组帧发送，然后阻塞等待 Jetson 回复并解析
- *        Jetson 回复帧格式: BB STATUS XOR (3字节)
- *        STATUS=0x01 剔除 | 0x02 放行, XOR = BB ^ STATUS
- */
-static void vUartTask(void *argument)
-{
-    static const uint8_t payload[] = {0x01, 0x00};  /* 固定占位数据 */
-    uint8_t frame[6];
-    uint8_t xor_val;
-    uint8_t reply_buf[3];
-    size_t i;
-
-    for (;;)
-    {
-        osSemaphoreAcquire(uartSemHandle, osWaitForever);
-
-        /* 组帧 */
-        frame[0] = FRAME_HEADER_1;
-        frame[1] = FRAME_HEADER_2;
-        frame[2] = FRAME_CMD;
-        frame[3] = payload[0];
-        frame[4] = payload[1];
-
-        /* XOR 校验：对命令字节 + 数据字节做异或 */
-        xor_val = FRAME_CMD;
-        for (i = 0; i < sizeof(payload); i++)
+        /*
+         * Fail-safe policy: a timeout, corrupt response or vision failure is
+         * rejected.  An uninspected part must never silently pass the line.
+         */
+        if ((waitStatus != osOK) ||
+            (sharedDecision.valid == 0U) ||
+            (sharedDecision.code != INSPECTION_RESULT_NORMAL))
         {
-            xor_val ^= payload[i];
-        }
-        frame[5] = xor_val;
-
-        HAL_UART_Transmit(&huart1, frame, sizeof(frame), 100);
-
-        /* 等待 Jetson 回复3字节: BB STATUS XOR */
-        if (HAL_UART_Receive(&huart1, reply_buf, 3, UART_REPLY_TIMEOUT_MS) == HAL_OK)
-        {
-            /* 校验回复帧: 帧头=0xBB, XOR=BB^STATUS */
-            if (reply_buf[0] == REPLY_HEADER &&
-                reply_buf[2] == (reply_buf[0] ^ reply_buf[1]))
+            if ((waitStatus != osOK) ||
+                (sharedDecision.valid == 0U) ||
+                (sharedDecision.code >= INSPECTION_RESULT_VISION_ERROR))
             {
-                g_uartReply = reply_buf[1];
+                ++metrics.fail_safe_rejects;
             }
-            else
-            {
-                g_uartReply = REPLY_NORMAL;  /* 校验失败，按无缺陷处理 */
-            }
+            ++metrics.rejected_parts;
+            HAL_GPIO_WritePin(Cylinder_GPIO_Port, Cylinder_Pin, GPIO_PIN_SET);
+            osDelay(CYLINDER_PULSE_MS);
+            HAL_GPIO_WritePin(Cylinder_GPIO_Port, Cylinder_Pin, GPIO_PIN_RESET);
         }
         else
         {
-            g_uartReply = REPLY_NORMAL;  /* 超时：按无缺陷处理 */
+            ++metrics.accepted_parts;
         }
 
-        /* 通知控制任务：回复已就绪 */
-        osSemaphoreRelease(uartDoneSemHandle);
+        BeltSetRunning(true);
     }
 }
 
-/* USER CODE END Application */
+static void CommunicationTask(void *argument)
+{
+    InspectionDecision decision;
 
+    (void)argument;
+    /* Scheduler is running here, so the ISR may safely use FreeRTOS
+       FromISR APIs.  Enable interrupt-driven RX before the first exchange. */
+    UART1_IsrStart();
+    for (;;)
+    {
+        ++communicationAliveCounter;
+        if (osSemaphoreAcquire(communicationStartSem, COMM_IDLE_POLL_MS) != osOK)
+        {
+            /* Between parts: service heartbeats and link supervision. */
+            CommunicationIdleService();
+            continue;
+        }
+        decision.code = INSPECTION_RESULT_VISION_ERROR;
+        decision.confidence = 0U;
+        decision.valid = CommunicationExchange(activeSequence, &decision) ? 1U : 0U;
+        sharedDecision = decision;
+        metrics.uart_errors += UART1_ConsumeErrorCount();
+        (void)osSemaphoreRelease(communicationDoneSem);
+    }
+}
+
+static void CommunicationIdleService(void)
+{
+    static InspectionParser idleParser;
+    static uint8_t heartbeatSequence;
+    static uint32_t lastHeartbeatAt;
+    static bool idleParserReady;
+    InspectionFrame frame;
+    uint8_t receivedByte;
+    uint8_t heartbeatFrame[INSPECTION_FRAME_SIZE];
+    uint8_t acknowledgeFrame[INSPECTION_FRAME_SIZE];
+
+    if (!idleParserReady)
+    {
+        InspectionProtocol_ParserInit(&idleParser);
+        idleParserReady = true;
+    }
+
+    while (UART1_IsrReadByte(&receivedByte, 0U))
+    {
+        if (InspectionProtocol_PushByte(&idleParser, receivedByte, &frame))
+        {
+            /* Any valid frame from the vision service proves the link. */
+            visionLastSeenAt = HAL_GetTick();
+            if (frame.type == INSPECTION_MSG_HEARTBEAT)
+            {
+                ++metrics.heartbeats_received;
+                InspectionProtocol_Build(INSPECTION_MSG_ACK,
+                                         frame.sequence,
+                                         INSPECTION_RESULT_NORMAL,
+                                         0U,
+                                         acknowledgeFrame);
+                if (!UART1_IsrSend(acknowledgeFrame, INSPECTION_FRAME_SIZE))
+                {
+                    ++metrics.uart_errors;
+                }
+            }
+            else if (frame.type != INSPECTION_MSG_ACK)
+            {
+                ++metrics.stale_frames;
+            }
+        }
+    }
+
+    /* Announce the controller while the line is idle so the vision
+       service can tell the MCU is alive too. */
+    if ((HAL_GetTick() - lastHeartbeatAt) >= MCU_HEARTBEAT_PERIOD_MS)
+    {
+        lastHeartbeatAt = HAL_GetTick();
+        ++heartbeatSequence;
+        InspectionProtocol_Build(INSPECTION_MSG_HEARTBEAT,
+                                 heartbeatSequence,
+                                 INSPECTION_RESULT_NORMAL,
+                                 0U,
+                                 heartbeatFrame);
+        if (UART1_IsrSend(heartbeatFrame, INSPECTION_FRAME_SIZE))
+        {
+            ++metrics.heartbeats_sent;
+        }
+        else
+        {
+            ++metrics.uart_errors;
+        }
+    }
+}
+
+static bool CommunicationIsVisionAlive(void)
+{
+    return ((HAL_GetTick() - visionLastSeenAt) < VISION_ALIVE_TIMEOUT_MS);
+}
+
+static void MonitorTask(void *argument)
+{
+    uint32_t lastDetect;
+    uint32_t lastExecute;
+    uint32_t lastCommunication;
+    uint32_t strikes;
+
+    (void)argument;
+    lastDetect = detectAliveCounter;
+    lastExecute = executeAliveCounter;
+    lastCommunication = communicationAliveCounter;
+    strikes = 0U;
+
+    for (;;)
+    {
+        osDelay(TASK_MONITOR_PERIOD_MS);
+        if ((detectAliveCounter == lastDetect) ||
+            (executeAliveCounter == lastExecute) ||
+            (communicationAliveCounter == lastCommunication))
+        {
+            ++strikes;
+        }
+        else
+        {
+            strikes = 0U;
+            Watchdog_Refresh();
+        }
+        if (strikes >= TASK_MONITOR_STRIKE_LIMIT)
+        {
+            /* A supervised task stopped running: stop servicing the
+               independent watchdog and wait for the hardware reset. */
+            for (;;)
+            {
+            }
+        }
+        lastDetect = detectAliveCounter;
+        lastExecute = executeAliveCounter;
+        lastCommunication = communicationAliveCounter;
+    }
+}
+
+static bool CommunicationExchange(uint8_t sequence, InspectionDecision *decision)
+{
+    uint8_t triggerFrame[INSPECTION_FRAME_SIZE];
+    uint8_t acknowledgeFrame[INSPECTION_FRAME_SIZE];
+    uint8_t receivedByte;
+    uint32_t startedAt;
+    uint32_t elapsed;
+    bool retried = false;
+    InspectionParser parser;
+    InspectionFrame frame;
+
+    InspectionProtocol_ParserInit(&parser);
+    InspectionProtocol_Build(INSPECTION_MSG_TRIGGER,
+                             sequence,
+                             0U,
+                             0U,
+                             triggerFrame);
+
+    startedAt = HAL_GetTick();
+    if (!UART1_IsrSend(triggerFrame, INSPECTION_FRAME_SIZE))
+    {
+        ++metrics.uart_errors;
+        return false;
+    }
+
+    for (;;)
+    {
+        ++communicationAliveCounter;
+        elapsed = HAL_GetTick() - startedAt;
+        if (elapsed >= UART_TRANSACTION_BUDGET_MS)
+        {
+            ++metrics.uart_timeouts;
+            return false;
+        }
+
+        /* Block on the RX stream buffer for one byte; the ISR wakes this
+           task as soon as a byte arrives. */
+        if (UART1_IsrReadByte(&receivedByte, UART_BYTE_TIMEOUT_MS))
+        {
+            if (InspectionProtocol_PushByte(&parser, receivedByte, &frame))
+            {
+                visionLastSeenAt = HAL_GetTick();
+                if ((frame.type == INSPECTION_MSG_RESULT) &&
+                    (frame.sequence == sequence))
+                {
+                    if ((frame.code != INSPECTION_RESULT_NORMAL) &&
+                        (frame.code != INSPECTION_RESULT_NOTCH) &&
+                        (frame.code != INSPECTION_RESULT_DEFORMATION) &&
+                        (frame.code != INSPECTION_RESULT_VISION_ERROR))
+                    {
+                        ++metrics.protocol_errors;
+                        return false;
+                    }
+
+                    decision->code = frame.code;
+                    decision->confidence = frame.auxiliary;
+                    InspectionProtocol_Build(INSPECTION_MSG_ACK,
+                                             sequence,
+                                             frame.code,
+                                             0U,
+                                             acknowledgeFrame);
+                    if (!UART1_IsrSend(acknowledgeFrame, INSPECTION_FRAME_SIZE))
+                    {
+                        ++metrics.uart_errors;
+                        return false;
+                    }
+                    elapsed = HAL_GetTick() - startedAt;
+                    if (elapsed > metrics.max_transaction_ms)
+                    {
+                        metrics.max_transaction_ms = elapsed;
+                    }
+                    return true;
+                }
+                ++metrics.stale_frames;
+            }
+        }
+
+        elapsed = HAL_GetTick() - startedAt;
+        if ((!retried) && (elapsed >= UART_RETRY_AT_MS))
+        {
+            retried = true;
+            ++metrics.uart_retries;
+            if (!UART1_IsrSend(triggerFrame, INSPECTION_FRAME_SIZE))
+            {
+                ++metrics.uart_errors;
+                return false;
+            }
+        }
+    }
+}
+
+static void FailSafeHalt(void)
+{
+    taskDISABLE_INTERRUPTS();
+    BeltSetRunning(false);
+    HAL_GPIO_WritePin(Cylinder_GPIO_Port, Cylinder_Pin, GPIO_PIN_RESET);
+    for (;;)
+    {
+    }
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t task, char *taskName)
+{
+    (void)task;
+    (void)taskName;
+    FailSafeHalt();
+}

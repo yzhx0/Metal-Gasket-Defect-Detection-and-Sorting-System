@@ -29,7 +29,7 @@ extern "C" {
 #include "main.h"
 
 /* USER CODE BEGIN Includes */
-
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 extern UART_HandleTypeDef huart1;
@@ -41,7 +41,10 @@ extern UART_HandleTypeDef huart1;
 void MX_USART1_UART_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-
+void UART1_IsrStart(void);
+bool UART1_IsrSend(const uint8_t *data, uint16_t length);
+bool UART1_IsrReadByte(uint8_t *byte, uint32_t timeoutMs);
+uint32_t UART1_ConsumeErrorCount(void);
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

@@ -1,0 +1,19 @@
+[Unit]
+Description=Jetson washer visual inspection service
+After=dev-ttyTHS1.device
+Wants=dev-ttyTHS1.device
+
+[Service]
+Type=simple
+User=inspection
+Group=inspection
+WorkingDirectory=/opt/washer-inspection
+EnvironmentFile=-/etc/washer-inspection.env
+ExecStart=/usr/bin/python3 /opt/washer-inspection/jetson_csi_infer.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

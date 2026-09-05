@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  firmware:
+    name: Firmware (STM32F103 cross build)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi cmake ninja-build
+
+      - name: Configure
+        run: >
+          cmake -S led2 -B led2/build-ci -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=led2/cmake/gcc-arm-none-eabi.cmake
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build led2/build-ci
+
+      - name: Check Flash/SRAM budget
+        run: |
+          arm-none-eabi-size led2/build-ci/led2.elf > /tmp/firmware-size.txt
+          cat /tmp/firmware-size.txt
+          python3 ci/check_firmware_size.py /tmp/firmware-size.txt
+
+  python:
+    name: Protocol tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check (all shipped Python)
+        run: python -m compileall -q inspection_protocol.py jetson_csi_infer.py tests ci
+
+      - name: Protocol unit tests
+        run: python -m unittest discover -s tests -v
