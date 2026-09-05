@@ -114,12 +114,6 @@ TensorRT / PyCUDA / OpenCV 由 JetPack 提供；串口依赖 `pyserial`。
   `ci/check_firmware_size.py` 校验 Flash/SRAM 预算，超限即失败。
 - **Python**：全部 Python 文件语法检查 + 协议单元测试。
 
-## 已知限制
-
-- 仓库不含垫片数据集、训练权重与 TensorRT engine，无法从当前代码推导检测准确率；
-  上线前需按 `docs/工程化说明.md` 第 4 节完成精度、时延与失效注入验证。
-- "≤195 ms" 指光电触发到 STM32 形成决策（不含 120 ms 气缸保持时间），引用时建议附样本量与 P95/P99 统计。
-
 ## 许可证
 
 [MIT](LICENSE)
